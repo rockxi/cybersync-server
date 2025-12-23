@@ -1,0 +1,9 @@
+services:
+    cybersync:
+        build: .
+        container_name: cybersync
+        restart: unless-stopped
+        ports:
+            - "6767:8000"
+
+
