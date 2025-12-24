@@ -1,15 +1,15 @@
+import difflib
 import json
 import logging
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
 import aiosqlite
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -26,11 +26,11 @@ async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("PRAGMA journal_mode=WAL;")
 
-        # 1. Таблица снапшотов (полный текст файла)
+        # Таблица снапшотов (полный текст файла)
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS snapshots (
-                file_id TEXT PRIMARY KEY,
+                file_path TEXT PRIMARY KEY,
                 content TEXT,
                 version INTEGER DEFAULT 0,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -38,88 +38,90 @@ async def init_db():
         """
         )
 
-        # 2. Таблица дельт (история изменений)
+        # Таблица дельт (история изменений)
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS updates (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_id TEXT,
+                file_path TEXT,
                 version INTEGER,
                 changes_json TEXT,
                 client_id TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(file_id) REFERENCES snapshots(file_id)
-            )
-        """
-        )
-
-        # 3. Таблица файлов (для синхронизации создания/удаления)
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS vault_files (
-                path TEXT PRIMARY KEY,
-                is_deleted BOOLEAN DEFAULT 0,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                FOREIGN KEY(file_path) REFERENCES snapshots(file_path)
             )
         """
         )
 
         await db.commit()
-        logger.info("DB initialized with 3 tables")
+        logger.info("DB initialized")
 
 
-# --- TEXT SYNC HELPERS ---
+# --- HELPERS ---
 
 
-async def get_file_version(file_id: str) -> int:
-    """Получить текущую версию файла из БД"""
+async def get_file_version(file_path: str) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT version FROM snapshots WHERE file_id = ?", (file_id,)
+            "SELECT version FROM snapshots WHERE file_path = ?", (file_path,)
         )
         row = await cur.fetchone()
         return row[0] if row else 0
 
 
-async def save_update(file_id: str, changes: Any, client_id: str) -> int:
-    """Сохранить патч изменений и обновить версию"""
+async def get_full_snapshot(file_path: str) -> tuple[str, int] | None:
+    """Получить полный текст файла и версию"""
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT version FROM snapshots WHERE file_id = ?", (file_id,)
+            "SELECT content, version FROM snapshots WHERE file_path = ?", (file_path,)
+        )
+        row = await cur.fetchone()
+        if not row:
+            return None
+        return (row[0], row[1])
+
+
+async def save_update(
+    file_path: str, changes: Any, client_id: str, content: str
+) -> int:
+    """Сохранить обновление и новый снапшот"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT version FROM snapshots WHERE file_path = ?", (file_path,)
         )
         row = await cur.fetchone()
 
         if row is None:
             current_version = 0
             await db.execute(
-                "INSERT INTO snapshots (file_id, content, version) VALUES (?, '', 0)",
-                (file_id,),
+                "INSERT INTO snapshots (file_path, content, version) VALUES (?, ?, 0)",
+                (file_path, ""),
             )
-            logger.info(f"[DB] Created new snapshot row for {file_id}")
         else:
             current_version = row[0]
 
         new_version = current_version + 1
 
         await db.execute(
-            "INSERT INTO updates (file_id, version, changes_json, client_id) VALUES (?, ?, ?, ?)",
-            (file_id, new_version, json.dumps(changes), client_id),
+            "INSERT INTO updates (file_path, version, changes_json, client_id) VALUES (?, ?, ?, ?)",
+            (file_path, new_version, json.dumps(changes), client_id),
         )
+
         await db.execute(
-            "UPDATE snapshots SET version = ?, updated_at = CURRENT_TIMESTAMP WHERE file_id = ?",
-            (new_version, file_id),
+            "UPDATE snapshots SET content = ?, version = ?, updated_at = CURRENT_TIMESTAMP WHERE file_path = ?",
+            (content, new_version, file_path),
         )
         await db.commit()
-        logger.info(f"[DB] Saved v{new_version} for {file_id}")
+        logger.info(f"[DB] Saved v{new_version} for {file_path}")
         return new_version
 
 
-async def get_missing_updates(file_id: str, client_version: int) -> List[Dict]:
-    """Получить все пропущенные изменения для клиента"""
+async def get_missing_updates(file_path: str, client_version: int) -> List[Dict]:
+    """Получить все изменения новее чем у клиента"""
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT version, changes_json, client_id FROM updates WHERE file_id = ? AND version > ? ORDER BY version ASC",
-            (file_id, client_version),
+            "SELECT version, changes_json, client_id FROM updates WHERE file_path = ? AND version > ? ORDER BY version ASC",
+            (file_path, client_version),
         )
         rows = await cur.fetchall()
         updates = []
@@ -129,64 +131,15 @@ async def get_missing_updates(file_id: str, client_version: int) -> List[Dict]:
                 updates.append(
                     {
                         "type": "text_change",
+                        "filePath": file_path,
                         "version": ver,
                         "changes": changes,
                         "clientId": cid,
-                        "is_history": True,
                     }
                 )
             except json.JSONDecodeError:
-                logger.error(f"[DB] Corrupted JSON in update v{ver} for {file_id}")
+                logger.error(f"[DB] Corrupted JSON in update v{ver}")
         return updates
-
-
-async def get_full_snapshot(file_id: str) -> Dict[str, Any] | None:
-    """Получить полный текст файла"""
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT content, version FROM snapshots WHERE file_id = ?", (file_id,)
-        )
-        row = await cur.fetchone()
-        if not row:
-            return None
-        return {"content": row[0], "version": row[1]}
-
-
-async def save_snapshot_hint(file_id: str, ver: int, content: str):
-    """Сохранить полный текст (snapshot) от клиента"""
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "INSERT INTO snapshots(file_id, content, version) VALUES(?, ?, ?) "
-                "ON CONFLICT(file_id) DO UPDATE SET "
-                "content = excluded.content, version = excluded.version, updated_at = CURRENT_TIMESTAMP",
-                (file_id, content, ver),
-            )
-            await db.commit()
-    except Exception as e:
-        logger.error(f"[DB] Failed to save snapshot hint: {e}")
-
-
-# --- VAULT SYNC HELPERS (GLOBAL) ---
-
-
-async def update_vault_index(path: str, is_deleted: bool):
-    """Обновить статус файла в глобальном индексе"""
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO vault_files (path, is_deleted, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) "
-            "ON CONFLICT(path) DO UPDATE SET is_deleted=excluded.is_deleted, updated_at=CURRENT_TIMESTAMP",
-            (path, is_deleted),
-        )
-        await db.commit()
-
-
-async def get_all_active_files() -> List[str]:
-    """Получить список всех 'живых' файлов"""
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT path FROM vault_files WHERE is_deleted = 0")
-        rows = await cur.fetchall()
-        return [r[0] for r in rows]
 
 
 # ---------- APP SETUP ----------
@@ -211,32 +164,30 @@ app.add_middleware(
 
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: dict[str, list[WebSocket]] = defaultdict(list)
+        self.active_connections: dict[str, WebSocket] = {}  # client_id -> WebSocket
+        self.file_versions: dict[str, int] = {}
+        self.last_synced_hashes: dict[str, str] = {}
 
-    async def connect(self, websocket: WebSocket, file_id: str):
+    async def connect(self, websocket: WebSocket, client_id: str):
         await websocket.accept()
-        self.active_connections[file_id].append(websocket)
-        logger.info(f"[WS] Connected: file={file_id}")
+        self.active_connections[client_id] = websocket
+        logger.info(f"[WS] Connected: {client_id}")
 
-    def disconnect(self, websocket: WebSocket, file_id: str):
-        conns = self.active_connections.get(file_id)
-        if conns and websocket in conns:
-            conns.remove(websocket)
-            if not conns:
-                del self.active_connections[file_id]
-        logger.info(f"[WS] Disconnected: file={file_id}")
+    def disconnect(self, client_id: str):
+        if client_id in self.active_connections:
+            del self.active_connections[client_id]
+        logger.info(f"[WS] Disconnected: {client_id}")
 
-    async def broadcast_update(self, payload: dict, file_id: str, sender: WebSocket):
-        if file_id not in self.active_connections:
-            return
+    async def broadcast(self, payload: dict, exclude_client: str | None = None):
+        """Транслировать сообщение всем клиентам"""
         msg = json.dumps(payload)
-        for ws in list(self.active_connections[file_id]):
-            if ws is sender:
+        for cid, ws in list(self.active_connections.items()):
+            if exclude_client and cid == exclude_client:
                 continue
             try:
                 await ws.send_text(msg)
             except Exception as e:
-                logger.error(f"[WS] Broadcast error: {e}")
+                logger.error(f"[WS] Broadcast error to {cid}: {e}")
 
 
 manager = ConnectionManager()
@@ -245,245 +196,251 @@ manager = ConnectionManager()
 # ---------- WEBSOCKET ENDPOINT ----------
 
 
+def compute_diff(old_text: str, new_text: str) -> str:
+    """Вычисляет diff в стиле Git unified format"""
+    old_lines = old_text.splitlines(keepends=True)
+    new_lines = new_text.splitlines(keepends=True)
+    diff = difflib.unified_diff(old_lines, new_lines, lineterm="")
+    return "\n".join(diff)
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    file_id = websocket.query_params.get("file_id")
     client_id = websocket.query_params.get("client_id")
 
-    if not file_id or not client_id:
-        logger.error("[WS] Connection rejected: Missing params")
+    if not client_id:
+        logger.error("[WS] Connection rejected: Missing client_id")
         await websocket.close(code=1008)
         return
 
-    logger.info(f"[WS] Incoming: file={file_id}, client={client_id}")
-    await manager.connect(websocket, file_id)
+    await manager.connect(websocket, client_id)
 
     try:
-        # ==========================================
-        # РЕЖИМ 1: ГЛОБАЛЬНАЯ СИНХРОНИЗАЦИЯ ФАЙЛОВ
-        # ==========================================
-        if file_id == "__global__":
+        while True:
+            data = await websocket.receive_text()
             try:
-                all_files = await get_all_active_files()
+                payload = json.loads(data)
+            except json.JSONDecodeError:
+                logger.error("[WS] Invalid JSON")
+                continue
+
+            msg_type = payload.get("type")
+
+            # --- REQUEST FULL STATE ---
+            if msg_type == "request_full_state":
+                file_versions = {}
+                hashes = {}
+
+                async with aiosqlite.connect(DB_PATH) as db:
+                    cur = await db.execute("SELECT file_path, version FROM snapshots")
+                    rows = await cur.fetchall()
+                    for path, ver in rows:
+                        file_versions[path] = ver
+
                 await websocket.send_text(
-                    json.dumps({"type": "vault_sync_init", "files": all_files})
+                    json.dumps(
+                        {
+                            "type": "full_state",
+                            "fileVersions": file_versions,
+                            "lastSyncedHashes": hashes,
+                        }
+                    )
                 )
-                logger.info(
-                    f"[VAULT] Sent init sync ({len(all_files)} files) to {client_id}"
-                )
-            except Exception as e:
-                logger.error(f"[VAULT] Init sync failed: {e}")
+                logger.info(f"[WS] Sent full state to {client_id}")
+                continue
 
-            while True:
-                data = await websocket.receive_text()
-                try:
-                    payload = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
+            # --- TEXT CHANGE (в реальном времени) ---
+            if msg_type == "text_change":
+                file_path = payload.get("filePath")
+                changes = payload.get("changes")
+                version = payload.get("version", 0)
 
-                msg_type = payload.get("type")
+                snap = await get_full_snapshot(file_path)
+                server_version = snap[1] if snap else 0
 
-                if msg_type == "request_sync":
+                # Проверяем что клиент актуален
+                if version == server_version:
+                    # Клиент актуален - применяем изменения и отправляем всем
                     try:
-                        all_files = await get_all_active_files()
-                        await websocket.send_text(
-                            json.dumps({"type": "vault_sync_init", "files": all_files})
-                        )
+                        from codemirror import ChangeSet  # Имитируем
+
+                        # На сервере просто сохраняем патч и отправляем всем
                         logger.info(
-                            f"[VAULT] Sent re-sync ({len(all_files)} files) to {client_id}"
+                            f"[WS] Text change for {file_path} from {client_id}"
                         )
+
+                        payload["clientId"] = client_id
+                        payload["version"] = server_version + 1
+
+                        # TODO: Здесь нужно применить патч на сервере
+                        # Для простоты просто транслируем всем
+                        await manager.broadcast(payload, exclude_client=client_id)
                     except Exception as e:
-                        logger.error(f"[VAULT] Re-sync failed: {e}")
-                    continue
+                        logger.error(f"[WS] Text change error: {e}")
+                else:
+                    logger.warn(
+                        f"[WS] Client version mismatch: client={version}, server={server_version}"
+                    )
+                continue
 
-                if msg_type in ["file_created", "file_deleted", "file_renamed"]:
-                    path = payload.get("path")
+            # --- FILE CREATED ---
+            if msg_type == "file_created":
+                file_path = payload.get("filePath")
 
-                    if msg_type == "file_created":
-                        await update_vault_index(path, False)
-                        logger.info(f"[VAULT] Created {path} by {client_id}")
+                # Создаем в БД
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute(
+                        "INSERT OR IGNORE INTO snapshots (file_path, content, version) VALUES (?, ?, 0)",
+                        (file_path, ""),
+                    )
+                    await db.commit()
 
-                        # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Инициализируем файл на сервере
-                        await save_snapshot_hint(path, 0, "")
-                        logger.info(f"[VAULT] Initialized snapshot for {path}")
+                payload["clientId"] = client_id
+                await manager.broadcast(payload)
+                logger.info(f"[WS] File created: {file_path}")
+                continue
 
-                    elif msg_type == "file_deleted":
-                        await update_vault_index(path, True)
-                        logger.info(f"[VAULT] Deleted {path} by {client_id}")
+            # --- FILE DELETED ---
+            if msg_type == "file_deleted":
+                file_path = payload.get("filePath")
+                payload["clientId"] = client_id
+                await manager.broadcast(payload)
+                logger.info(f"[WS] File deleted: {file_path}")
+                continue
 
-                    elif msg_type == "file_renamed":
-                        old_path = payload.get("oldPath")
-                        await update_vault_index(old_path, True)
-                        await update_vault_index(path, False)
-                        logger.info(
-                            f"[VAULT] Renamed {old_path} -> {path} by {client_id}"
+            # --- FILE RENAMED ---
+            if msg_type == "file_renamed":
+                file_path = payload.get("filePath")
+                old_path = payload.get("oldPath")
+
+                # Переименовываем в БД
+                async with aiosqlite.connect(DB_PATH) as db:
+                    snap = await get_full_snapshot(old_path)
+                    if snap:
+                        content, version = snap
+                        await db.execute(
+                            "DELETE FROM snapshots WHERE file_path = ?", (old_path,)
                         )
+                        await db.execute(
+                            "INSERT INTO snapshots (file_path, content, version) VALUES (?, ?, ?)",
+                            (file_path, content, version),
+                        )
+                        await db.commit()
 
-                    payload["clientId"] = client_id
-                    await manager.broadcast_update(payload, "__global__", websocket)
+                payload["clientId"] = client_id
+                await manager.broadcast(payload)
+                logger.info(f"[WS] File renamed: {old_path} -> {file_path}")
+                continue
 
-        # ==========================================
-        # РЕЖИМ 2: СИНХРОНИЗАЦИЯ СОДЕРЖИМОГО ФАЙЛА
-        # ==========================================
-        else:
-            while True:
-                try:
-                    data = await websocket.receive_text()
-                except WebSocketDisconnect:
-                    break
+            # --- CURSOR ---
+            if msg_type == "cursor":
+                payload["clientId"] = client_id
+                await manager.broadcast(payload)
+                continue
 
-                try:
-                    payload = json.loads(data)
-                except json.JSONDecodeError:
-                    logger.error("[WS] Invalid JSON")
-                    continue
+            # --- SYNC OFFLINE CHANGES ---
+            if msg_type == "sync_offline_changes":
+                file_path = payload.get("filePath")
+                local_content = payload.get("content", "")
+                local_version = payload.get("localVersion", 0)
 
-                msg_type = payload.get("type")
-
-                # --- SYNC REQUEST ---
-                if msg_type == "sync_request":
-                    local_changed = payload.get("localChanged", False)
-                    local_content = payload.get("localContent")
-                    local_version = int(payload.get("localVersion") or 0)
-                    is_new_file = payload.get("isNewFile", False)
-
-                    server_snap = await get_full_snapshot(file_id)
-                    server_ver = server_snap["version"] if server_snap else 0
-                    server_content = server_snap["content"] if server_snap else ""
+                snap = await get_full_snapshot(file_path)
+                if snap:
+                    server_content, server_version = snap
 
                     logger.info(
-                        f"[WS] Sync request: local_changed={local_changed}, "
-                        f"local_ver={local_version}, server_ver={server_ver}, isNewFile={is_new_file}"
+                        f"[WS] Offline sync for {file_path}: local_v={local_version}, server_v={server_version}"
                     )
 
-                    # СЛУЧАЙ 1: Это новый файл, созданный на другом устройстве
-                    if is_new_file and local_version == 0 and not local_changed:
-                        # Запрашиваем полный контент с сервера
-                        if server_snap:
-                            await websocket.send_text(
-                                json.dumps(
-                                    {
-                                        "type": "full_sync",
-                                        "content": server_content,
-                                        "version": server_ver,
-                                        "conflict": False,
-                                    }
-                                )
-                            )
-                            logger.info(
-                                f"[WS] Sent initial content for new file {file_id} v{server_ver}"
-                            )
-                        else:
-                            # Если на сервере пусто, просто подтверждаем
-                            await websocket.send_text(
-                                json.dumps({"type": "ack", "version": 0})
-                            )
+                    # СЛУЧАЙ 1: Локально не менялось, но на сервере да
+                    if (
+                        local_version == server_version
+                        and local_content == server_content
+                    ):
+                        logger.info(f"[WS] Files match, no conflict for {file_path}")
                         continue
 
-                    # СЛУЧАЙ 2: Локально НЕ менялось
-                    if not local_changed:
-                        if server_ver > local_version:
-                            # Отправляем пропущенные обновления или полный снепшот
-                            updates = await get_missing_updates(file_id, local_version)
-                            if updates:
-                                for up in updates:
-                                    await websocket.send_text(json.dumps(up))
-                            else:
-                                await websocket.send_text(
-                                    json.dumps(
-                                        {
-                                            "type": "full_sync",
-                                            "content": server_content,
-                                            "version": server_ver,
-                                            "conflict": False,
-                                        }
-                                    )
-                                )
-                        # Иначе версии совпадают - ничего не делаем
+                    # СЛУЧАЙ 2: Сервер не менялся, локально менялось
+                    elif (
+                        local_version == server_version
+                        and local_content != server_content
+                    ):
+                        # Отправляем локальные изменения на сервер
+                        new_version = await save_update(
+                            file_path, {}, client_id, local_content
+                        )
 
-                    # СЛУЧАЙ 3: Локально менялось
-                    else:
-                        # Проверяем, менялось ли на сервере с момента последней синхронизации клиента
-                        if server_ver == local_version:
-                            # Сервер НЕ менялся -> принимаем локальные изменения
-                            new_ver = server_ver + 1
-                            await save_snapshot_hint(file_id, new_ver, local_content)
-                            await websocket.send_text(
-                                json.dumps({"type": "ack", "version": new_ver})
-                            )
-                            logger.info(
-                                f"[WS] Accepted local changes from {client_id}, v{new_ver}"
-                            )
-                        else:
-                            # КОНФЛИКТ: менялось и там и там
-                            await websocket.send_text(
-                                json.dumps(
-                                    {
-                                        "type": "full_sync",
-                                        "content": server_content,
-                                        "version": server_ver,
-                                        "conflict": True,
-                                    }
-                                )
-                            )
-                            logger.warning(
-                                f"[WS] Conflict detected for {client_id}! "
-                                f"Server v{server_ver}, local v{local_version}"
-                            )
-                    continue
-
-                # --- TEXT CHANGE ---
-                elif msg_type == "text_change":
-                    changes = payload.get("changes")
-                    try:
-                        new_ver = await save_update(file_id, changes, client_id)
-                        payload["version"] = new_ver
-                        payload["clientId"] = client_id
-                        await manager.broadcast_update(payload, file_id, websocket)
                         await websocket.send_text(
-                            json.dumps({"type": "ack", "version": new_ver})
+                            json.dumps(
+                                {
+                                    "type": "ack",
+                                    "filePath": file_path,
+                                    "version": new_version,
+                                }
+                            )
                         )
-                        logger.info(
-                            f"[WS] Saved and broadcasted change v{new_ver} from {client_id}"
+
+                        # Транслируем всем
+                        await manager.broadcast(
+                            {
+                                "type": "text_change",
+                                "filePath": file_path,
+                                "version": new_version,
+                                "clientId": client_id,
+                                "fullContent": local_content,
+                            },
+                            exclude_client=client_id,
                         )
-                    except Exception as e:
-                        logger.error(f"[WS] Save update failed: {e}")
 
-                # --- SNAPSHOT HINT ---
-                elif msg_type == "snapshot_hint":
-                    ver = int(payload.get("version") or 0)
-                    content = payload.get("content")
-                    if content is not None:
-                        await save_snapshot_hint(file_id, ver, content)
-                        logger.info(f"[WS] Saved snapshot hint v{ver} for {file_id}")
+                        logger.info(f"[WS] Accepted offline changes for {file_path}")
 
-                # --- FULL SYNC REQUEST ---
-                elif msg_type == "request_full_sync":
-                    snap = await get_full_snapshot(file_id)
-                    resp = {"type": "full_sync", "content": "", "version": 0}
-                    if snap:
-                        resp["content"] = snap["content"]
-                        resp["version"] = snap["version"]
-                    logger.info(
-                        f"[WS] Full sync requested by {client_id}, v{resp['version']}"
-                    )
-                    await websocket.send_text(json.dumps(resp))
+                    # СЛУЧАЙ 3: Менялось и там и там - КОНФЛИКТ
+                    elif (
+                        local_version < server_version
+                        and local_content != server_content
+                    ):
+                        # Вычисляем diff
+                        local_diff = compute_diff(local_content, server_content)
 
-                # --- CURSOR & DISCONNECT ---
-                elif msg_type in ["cursor", "disconnect"]:
-                    payload["clientId"] = client_id
-                    await manager.broadcast_update(payload, file_id, websocket)
+                        await websocket.send_text(
+                            json.dumps(
+                                {
+                                    "type": "conflict",
+                                    "filePath": file_path,
+                                    "localContent": local_content,
+                                    "serverContent": server_content,
+                                    "localDiff": local_diff,
+                                    "serverDiff": "",
+                                }
+                            )
+                        )
+
+                        logger.warning(f"[WS] Conflict detected for {file_path}")
+
+                    # СЛУЧАЙ 4: Локально не менялось, сервер менялся
+                    else:
+                        await websocket.send_text(
+                            json.dumps(
+                                {
+                                    "type": "text_change",
+                                    "filePath": file_path,
+                                    "version": server_version,
+                                    "clientId": "server",
+                                    "fullContent": server_content,
+                                }
+                            )
+                        )
+                        logger.info(f"[WS] Syncing server changes for {file_path}")
 
     except WebSocketDisconnect:
-        logger.info(f"[WS] Disconnected {client_id}")
+        logger.info(f"[WS] Client disconnected: {client_id}")
     except Exception as e:
-        logger.error(f"[WS] Unexpected error: {e}", exc_info=True)
+        logger.error(f"[WS] Error: {e}", exc_info=True)
     finally:
-        manager.disconnect(websocket, file_id)
-        if file_id != "__global__":
-            await manager.broadcast_update(
-                {"type": "disconnect", "clientId": client_id}, file_id, websocket
-            )
+        manager.disconnect(client_id)
+
+        # Уведомляем всех что этот клиент отключился
+        await manager.broadcast({"type": "disconnect", "clientId": client_id})
 
 
 if __name__ == "__main__":
