@@ -26,6 +26,30 @@ async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("PRAGMA journal_mode=WAL;")
 
+        # Проверяем существует ли старая схема и мигрируем
+        try:
+            cur = await db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='snapshots'"
+            )
+            table_exists = await cur.fetchone()
+
+            if table_exists:
+                # Проверяем какой схемы таблица
+                cur = await db.execute("PRAGMA table_info(snapshots)")
+                columns = await cur.fetchall()
+                col_names = [col[1] for col in columns]
+
+                if "file_id" in col_names and "file_path" not in col_names:
+                    # Мигрируем старую схему
+                    logger.info("[DB] Migrating from file_id to file_path...")
+                    await db.execute(
+                        "ALTER TABLE snapshots RENAME COLUMN file_id TO file_path"
+                    )
+                    await db.commit()
+                    logger.info("[DB] Migration complete!")
+        except Exception as e:
+            logger.warning(f"[DB] Migration check failed: {e}")
+
         # Таблица снапшотов (полный текст файла)
         await db.execute(
             """
@@ -54,7 +78,7 @@ async def init_db():
         )
 
         await db.commit()
-        logger.info("DB initialized")
+        logger.info("[DB] Database initialized")
 
 
 # --- HELPERS ---
@@ -246,7 +270,9 @@ async def websocket_endpoint(websocket: WebSocket):
                         }
                     )
                 )
-                logger.info(f"[WS] Sent full state to {client_id}")
+                logger.info(
+                    f"[WS] Sent full state to {client_id} ({len(file_versions)} files)"
+                )
                 continue
 
             # --- TEXT CHANGE (в реальном времени) ---
@@ -262,9 +288,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 if version == server_version:
                     # Клиент актуален - применяем изменения и отправляем всем
                     try:
-                        from codemirror import ChangeSet  # Имитируем
-
-                        # На сервере просто сохраняем патч и отправляем всем
                         logger.info(
                             f"[WS] Text change for {file_path} from {client_id}"
                         )
@@ -272,13 +295,12 @@ async def websocket_endpoint(websocket: WebSocket):
                         payload["clientId"] = client_id
                         payload["version"] = server_version + 1
 
-                        # TODO: Здесь нужно применить патч на сервере
-                        # Для простоты просто транслируем всем
+                        # Транслируем всем (кроме отправителя)
                         await manager.broadcast(payload, exclude_client=client_id)
                     except Exception as e:
                         logger.error(f"[WS] Text change error: {e}")
                 else:
-                    logger.warn(
+                    logger.warning(
                         f"[WS] Client version mismatch: client={version}, server={server_version}"
                     )
                 continue
@@ -441,6 +463,18 @@ async def websocket_endpoint(websocket: WebSocket):
 
         # Уведомляем всех что этот клиент отключился
         await manager.broadcast({"type": "disconnect", "clientId": client_id})
+
+
+@app.get("/health")
+async def health():
+    """Health check endpoint"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("SELECT 1")
+        return {"status": "ok", "db": "connected"}
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return {"status": "error", "db": "disconnected"}, 503
 
 
 if __name__ == "__main__":
