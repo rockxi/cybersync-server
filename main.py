@@ -341,6 +341,74 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 msg_type = payload.get("type")
 
+                # --- SYNC REQUEST (новая логика синхронизации) ---
+                if msg_type == "sync_request":
+                    local_changed = payload.get("localChanged", False)
+                    local_content = payload.get("localContent")
+                    local_version = int(payload.get("localVersion") or 0)
+                    server_ver = await get_file_version(file_id)
+                    
+                    logger.info(
+                        f"[WS] Sync request: local_changed={local_changed}, "
+                        f"local_ver={local_version}, server_ver={server_ver}"
+                    )
+                    
+                    # Случай 1: Локально не менялось - просто подгрузить с сервера
+                    if not local_changed:
+                        if server_ver > local_version:
+                            # Есть обновления на сервере
+                            snap = await get_full_snapshot(file_id)
+                            if snap:
+                                await websocket.send_text(
+                                    json.dumps(
+                                        {
+                                            "type": "full_sync",
+                                            "content": snap["content"],
+                                            "version": snap["version"],
+                                        }
+                                    )
+                                )
+                                logger.info(f"[WS] Sent server updates to {client_id}")
+                        else:
+                            # Ничего не менялось - подтвердить
+                            await websocket.send_text(
+                                json.dumps({"type": "ack", "version": server_ver})
+                            )
+                    
+                    # Случай 2: Локально менялось
+                    else:
+                        if server_ver == local_version:
+                            # На сервере не менялось - отправить локальное на сервер
+                            if local_content is not None:
+                                new_ver = server_ver + 1
+                                await save_snapshot_hint(file_id, new_ver, local_content)
+                                await websocket.send_text(
+                                    json.dumps({"type": "ack", "version": new_ver})
+                                )
+                                logger.info(
+                                    f"[WS] Accepted local changes from {client_id}, v{new_ver}"
+                                )
+                        else:
+                            # Конфликт! Менялось и на сервере, и локально
+                            # Простая стратегия: сервер побеждает
+                            snap = await get_full_snapshot(file_id)
+                            if snap:
+                                await websocket.send_text(
+                                    json.dumps(
+                                        {
+                                            "type": "full_sync",
+                                            "content": snap["content"],
+                                            "version": snap["version"],
+                                            "conflict": True,
+                                        }
+                                    )
+                                )
+                                logger.warning(
+                                    f"[WS] Conflict detected for {client_id}! "
+                                    f"Server version wins (v{snap['version']})"
+                                )
+                    continue
+
                 # --- HANDSHAKE ---
                 if msg_type == "handshake":
                     client_ver = int(payload.get("version") or 0)
