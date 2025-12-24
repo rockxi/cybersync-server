@@ -356,19 +356,27 @@ async def websocket_endpoint(websocket: WebSocket):
                     # Случай 1: Локально не менялось - просто подгрузить с сервера
                     if not local_changed:
                         if server_ver > local_version:
-                            # Есть обновления на сервере
-                            snap = await get_full_snapshot(file_id)
-                            if snap:
-                                await websocket.send_text(
-                                    json.dumps(
-                                        {
-                                            "type": "full_sync",
-                                            "content": snap["content"],
-                                            "version": snap["version"],
-                                        }
-                                    )
+                            # Есть обновления на сервере - отправить патчи
+                            updates = await get_missing_updates(file_id, local_version)
+                            if updates:
+                                logger.info(
+                                    f"[WS] Sending {len(updates)} patches to {client_id}"
                                 )
-                                logger.info(f"[WS] Sent server updates to {client_id}")
+                                for up in updates:
+                                    await websocket.send_text(json.dumps(up))
+                            else:
+                                # Если патчей нет - отправить snapshot
+                                snap = await get_full_snapshot(file_id)
+                                if snap:
+                                    await websocket.send_text(
+                                        json.dumps(
+                                            {
+                                                "type": "full_sync",
+                                                "content": snap["content"],
+                                                "version": snap["version"],
+                                            }
+                                        )
+                                    )
                         else:
                             # Ничего не менялось - подтвердить
                             await websocket.send_text(
