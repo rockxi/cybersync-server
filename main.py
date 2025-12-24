@@ -284,6 +284,20 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 msg_type = payload.get("type")
 
+                # Обработка запроса синхронизации
+                if msg_type == "request_sync":
+                    try:
+                        all_files = await get_all_active_files()
+                        await websocket.send_text(
+                            json.dumps({"type": "vault_sync_init", "files": all_files})
+                        )
+                        logger.info(
+                            f"[VAULT] Sent re-sync ({len(all_files)} files) to {client_id}"
+                        )
+                    except Exception as e:
+                        logger.error(f"[VAULT] Re-sync failed: {e}")
+                    continue
+
                 if msg_type in ["file_created", "file_deleted", "file_renamed"]:
                     path = payload.get("path")
 
@@ -387,7 +401,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         await save_snapshot_hint(file_id, ver, content)
 
                 # --- FULL SYNC REQUEST ---
-                elif msg_type == "full_sync":
+                elif msg_type == "full_sync" or msg_type == "request_full_sync":
                     snap = await get_full_snapshot(file_id)
                     resp = {"type": "full_sync", "content": "", "version": 0}
                     if snap:
@@ -396,6 +410,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             "content": snap["content"],
                             "version": snap["version"],
                         }
+                    logger.info(f"[WS] Full sync requested by {client_id}, version={resp['version']}")
                     await websocket.send_text(json.dumps(resp))
 
                 # --- CURSOR / DISCONNECT ---
